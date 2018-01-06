@@ -55,7 +55,7 @@ inline void __clflush(const char *address)
 
 // label defined in asm inline for loading kernel address, which purpose is
 // to help with software-based trap mitigation, when TSX isn't available.
-extern char __speculative_byte_load_exit[];
+extern char SPECULATIVE_EXIT[];
 
 inline void __speculative_byte_load(uintptr_t addr, char* dest) {
     asm __volatile__ (

